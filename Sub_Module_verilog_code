@@ -1,0 +1,139 @@
+module idx_sorted_32to4_BS #(
+    parameter DATA_WIDTH = 4,
+    parameter NUM_ELEMS = 8,
+    parameter INDEX_WIDTH = $clog2(NUM_ELEMS),
+    parameter TOTAL_DATA_WIDTH = NUM_ELEMS * DATA_WIDTH,
+    parameter TOTAL_INDEX_WIDTH = NUM_ELEMS * INDEX_WIDTH
+)(
+    input clk,
+    input rst,
+    input start,
+    input [TOTAL_DATA_WIDTH-1:0] unsorted_data,
+    input [DATA_WIDTH-1:0] search_key,
+    input [DATA_WIDTH-1:0] xmask,
+    output reg [TOTAL_DATA_WIDTH-1:0] sorted_data,
+    output reg [NUM_ELEMS-1:0] match_lines,
+    output reg done,
+    output reg [TOTAL_INDEX_WIDTH-1:0] sorted_indices,
+    output reg [TOTAL_INDEX_WIDTH-1:0] unsorted_indices
+);
+
+    // Internal arrays
+    reg [DATA_WIDTH-1:0] data_array [0:NUM_ELEMS-1];
+    reg [INDEX_WIDTH-1:0] index_array [0:NUM_ELEMS-1];
+    reg [DATA_WIDTH-1:0] temp_data;
+    reg [INDEX_WIDTH-1:0] temp_index;
+
+    wire [NUM_ELEMS-1:0] internal_match;
+
+    reg [$clog2(NUM_ELEMS+1)-1:0] stage;
+
+    localparam IDLE = 2'b00, LOAD = 2'b01, SORT = 2'b10, DONE = 2'b11;
+    reg [1:0] state;
+
+    // Compare and swap task
+    task compare_swap(input integer i, input integer j);
+        begin
+            if ((data_array[i] & ~xmask) > (data_array[j] & ~xmask)) begin
+                temp_data = data_array[i];
+                data_array[i] = data_array[j];
+                data_array[j] = temp_data;
+
+                temp_index = index_array[i];
+                index_array[i] = index_array[j];
+                index_array[j] = temp_index;
+            end
+        end
+    endtask
+
+    integer i;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= IDLE;
+            done <= 0;
+            sorted_data <= 0;
+            sorted_indices <= 0;
+            match_lines <= 0;
+            unsorted_indices <= 0;
+            stage <= 0;
+            for (i = 0; i < NUM_ELEMS; i = i + 1) begin
+                data_array[i] <= 0;
+                index_array[i] <= i[INDEX_WIDTH-1:0];
+            end
+        end else begin
+            case (state)
+                IDLE: begin
+                    done <= 0;
+                    if (start) begin
+                        state <= LOAD;
+                        stage <= 0;
+                    end
+                end
+
+                LOAD: begin
+                    for (i = 0; i < NUM_ELEMS; i = i + 1) begin
+                        data_array[i] <= unsorted_data[i*DATA_WIDTH +: DATA_WIDTH];
+                        index_array[i] <= i[INDEX_WIDTH-1:0];
+                        unsorted_indices[i*INDEX_WIDTH +: INDEX_WIDTH] <= i[INDEX_WIDTH-1:0];
+                    end
+                    state <= SORT;
+                end
+
+                SORT: begin
+                    // This replicates the exact original bubble sort network in 6 stages
+                    case (stage)
+                        0: begin compare_swap(0,1); compare_swap(2,3); compare_swap(4,5); compare_swap(6,7); end
+                        1: begin compare_swap(0,2); compare_swap(1,3); compare_swap(4,6); compare_swap(5,7); end
+                        2: begin compare_swap(0,4); compare_swap(1,5); compare_swap(2,6); compare_swap(3,7); end
+                        3: begin compare_swap(1,2); compare_swap(3,4); compare_swap(5,6); end
+                        4: begin compare_swap(0,1); compare_swap(2,3); compare_swap(4,5); compare_swap(6,7); end
+                        5: begin compare_swap(1,2); compare_swap(3,4); compare_swap(5,6); end
+                    endcase
+
+                    if (stage == 5) begin
+                        state <= DONE;
+                    end else begin
+                        stage <= stage + 1;
+                    end
+                end
+
+                DONE: begin
+                    for (i = 0; i < NUM_ELEMS; i = i + 1) begin
+                        sorted_data[i*DATA_WIDTH +: DATA_WIDTH] <= data_array[NUM_ELEMS-1-i];
+                        sorted_indices[i*INDEX_WIDTH +: INDEX_WIDTH] <= index_array[NUM_ELEMS-1-i];
+                    end
+                    match_lines <= internal_match;
+                    done <= 1;
+                    if (!start) state <= IDLE;
+                end
+            endcase
+        end
+    end
+
+    // Matching Logic
+    genvar j;
+    generate
+        for (j = 0; j < NUM_ELEMS; j = j + 1) begin : tcam_array
+            tcam_line_idx22 #(.KEY_WIDTH(DATA_WIDTH)) tcam_inst (
+                .key(search_key),
+                .stored_key(data_array[j]),
+                .xmask(xmask),
+                .match(internal_match[j])
+            );
+        end
+    endgenerate
+
+endmodule
+
+
+// TCAM Comparator Module (unchanged)
+module tcam_line_idx22 #(
+    parameter KEY_WIDTH = 4
+)(
+    input [KEY_WIDTH-1:0] key,
+    input [KEY_WIDTH-1:0] stored_key,
+    input [KEY_WIDTH-1:0] xmask,
+    output match
+);
+    assign match = ~|((key ^ stored_key) & ~xmask);
+endmodule
